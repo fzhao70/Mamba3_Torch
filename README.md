@@ -1,11 +1,11 @@
-# Pure-PyTorch Mamba-3 (SISO)
+# Pure-PyTorch Mamba-3 (SISO and MIMO)
 
-A differentiable SISO port of [state-spaces/mamba](https://github.com/state-spaces/mamba/tree/e9594ce),
+A differentiable SISO and MIMO port of [state-spaces/mamba](https://github.com/state-spaces/mamba/tree/e9594ce),
 commit `e9594ce`, implementing Mamba-3 (Lahoti et al., 2026, arXiv:2603.15569).
 Licensed under Apache-2.0; see [_official/LICENSE](_official/LICENSE).
 The original module and unmodified PyTorch test oracles are included for provenance.
 This port uses PyTorch and einops, with no Triton, mamba_ssm, custom CUDA, or additional dependencies.
-CPU and ordinary PyTorch CUDA backends are supported; MIMO is not ported.
+CPU and ordinary PyTorch CUDA backends are supported.
 
 Install with `pip install -e .` from the repo root, or put the repo root on `PYTHONPATH`:
 
@@ -27,8 +27,8 @@ y, layer_states = stack(u, return_final_states=True)
 y_next, layer_states = stack.step(u[:, 0], layer_states)
 ```
 
-`Mamba3` retains the official SISO constructor and state_dict names/shapes;
-official SISO weights load with `strict=True`. `Mamba3Block` implements
+`Mamba3` retains the official constructor and SISO/MIMO state_dict names/shapes;
+official weights load with `strict=True`. `Mamba3Block` implements
 `x + Mamba3(RMSNormGated(x))`; the stack adds a final RMSNorm. Blocks and stacks
 share the forward/step interface, with one state tuple per stack layer.
 
@@ -39,7 +39,7 @@ Q/K heads are repeated for GQA; `hq` must divide `h`. Step inputs omit L.
 Chunked returns the output, or `(output, states)` with `return_final_states=True`;
 step always returns both. `D`, `Z`/`z`, and input states are optional.
 
-States are `(Angle_State, SSM_State, K_State, V_State)`, with shapes
+SISO states are `(Angle_State, SSM_State, K_State, V_State)`, with shapes
 `(b,h,na)`, `(b,h,p,n)`, `(b,h,n)`, `(b,h,p)`. K is the last rotated key;
 its pending trapezoid contribution is kept out of the SSM state until the next
 token. States are returned without in-place mutation or detaching.
@@ -52,14 +52,41 @@ Chunked SSD uses batched operations within chunks and a loop over chunk
 summaries. Its attention memory is O(L × chunk_size); sequence length need
 not divide chunk_size. Nonempty, fixed-length batches are supported.
 
+## MIMO
+
+Use `Mamba3(32, d_state=16, headdim=8, is_mimo=True, mimo_rank=4)`;
+blocks and stacks accept the same MIMO options. `is_outproj_norm=True` enables
+per-head normalization before gating, with `fuse_pregate_headwise_norm=True`
+performing it inside the scan.
+
+The exported `mamba3_mimo_chunked` and `mamba3_mimo_step` take Q/K with shape
+`(b,L,R,hq,n)`, biases `(h,R,n)`, and MIMO projections `(h,R,p)`.
+Other inputs follow the SISO layout. With `MIMO_O=None`, the chunked op returns
+`(b,L,R,h,p)`; otherwise it contracts the ranks to `(b,L,h,p)`.
+MIMO states have shapes `(b,h,na)`, `(b,h,p,n)`, `(b,R,h,n)`, `(b,h,p)`;
+the V state stores raw x, before the MIMO projection.
+
+The default rotation pairs dimensions `i` and `i+n/2` for `i < na`, matching
+the official TileLang module. `rotate_pairwise=True` selects adjacent pairs
+`2i, 2i+1`, matching the official recurrent oracle. Unrotated dimensions stay
+unchanged. Module forward and step both use the default convention.
+
+`tests/test_mimo_parity.py` compares against the included official chunk,
+recurrent, and module oracles, and checks float64 step/chunk/carry consistency,
+autograd gradients, strict parameter shapes, autocast, and MIMO stacks.
+The scan, including fused normalization, preserves the SISO compute-dtype
+rule; the official oracles explicitly round some intermediates to float32.
+
 From the repo root, run the test suite (the CUDA smoke test skips on a CPU-only node):
 
 ```bash
 python -m pytest -q tests
 ```
 
-Verified 2026-09-27 (torch 2.5.1, CUDA 12.4): 346 passed on NVIDIA V100 and A100,
-345 passed + 1 CUDA skip on CPU.
+Verified 2026-09-28 (torch 2.5.1, CUDA 12.4): 1458 passed on NVIDIA V100 and A100,
+1455 passed + 3 CUDA skips on CPU. Parity with the official chunk oracle is float32-limited
+(max abs diff ~8e-6) because the oracle computes the angle cumsum in float32; the float64
+scan agrees with a float64 recurrent loop to ~1e-15.
 
 Benchmark forward plus backward separately from tests:
 
@@ -69,3 +96,7 @@ python bench.py --device cuda --batch 32 --seqlen 128 --d_model 256 --n_layer 4 
 
 The benchmark prints milliseconds per iteration and, on CUDA, peak allocated
 memory. Use `--device cpu` on a CPU node and `--warmup`/`--steps` to change repeats.
+Add `--mimo_rank 4` to benchmark MIMO (`0`, the default, selects SISO).
+For MIMO use `chunk_size=64 // mimo_rank` (the official recommendation): the intra-chunk block is
+`(chunk_size*R)^2`. With the default `chunk_size=64`, R=4 (b=32, L=128, d_model=256, 4 layers,
+d_state=128) takes 366 ms and 29.9 GiB per forward+backward on an A100, vs 67 ms / 7.3 GiB for SISO.

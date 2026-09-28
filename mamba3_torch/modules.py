@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Dao AI Lab, Goombalab.
-# SISO port of state-spaces/mamba e9594ce; Apache-2.0, see _official/LICENSE.
+# Port of state-spaces/mamba e9594ce; Apache-2.0, see _official/LICENSE.
 """Mamba-3 modules with explicit, differentiable recurrent states."""
 
 import math
@@ -10,7 +10,10 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .norm import RMSNormGated
-from .ops import _compute_dtype, _initial_states, mamba3_siso_chunked, mamba3_siso_step
+from .ops import (
+    _compute_dtype, _initial_states, _mimo_initial_states,
+    mamba3_mimo_chunked, mamba3_mimo_step, mamba3_siso_chunked, mamba3_siso_step,
+)
 
 
 def heavy_tail_activation(x):
@@ -45,8 +48,6 @@ class Mamba3(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        if is_mimo:
-            raise NotImplementedError("MIMO not ported yet")
         factory_kwargs = {"device": device, "dtype": dtype}
         self.d_model = d_model
         self.d_state = d_state
@@ -57,8 +58,12 @@ class Mamba3(nn.Module):
         self.A_floor = A_floor
         self.is_outproj_norm = is_outproj_norm
         self.is_mimo = is_mimo
-        self.mimo_rank = 1
-        self.fuse_pregate_headwise_norm = False
+        self.mimo_rank = mimo_rank if is_mimo else 1
+        if not isinstance(self.mimo_rank, int) or self.mimo_rank <= 0:
+            raise ValueError("mimo_rank must be a positive integer")
+        self.fuse_pregate_headwise_norm = bool(
+            fuse_pregate_headwise_norm and is_mimo and is_outproj_norm
+        )
         self.d_inner = int(self.expand * self.d_model)
         assert self.d_inner % self.headdim == 0
         self.nheads = self.d_inner // self.headdim
@@ -94,6 +99,16 @@ class Mamba3(nn.Module):
         )
         self.B_norm = RMSNormGated(self.d_state, eps=1e-5, **factory_kwargs)
         self.C_norm = RMSNormGated(self.d_state, eps=1e-5, **factory_kwargs)
+        if self.is_mimo:
+            self.mimo_x = nn.Parameter(
+                torch.ones(self.nheads, self.mimo_rank, self.headdim, device=device) / self.mimo_rank,
+            )
+            self.mimo_z = nn.Parameter(
+                torch.ones(self.nheads, self.mimo_rank, self.headdim, device=device),
+            )
+            self.mimo_o = nn.Parameter(
+                torch.ones(self.nheads, self.mimo_rank, self.headdim, device=device) / self.mimo_rank,
+            )
         self.D = nn.Parameter(torch.ones(self.nheads, device=device))
         self.D._no_weight_decay = True
         if self.is_outproj_norm:
@@ -130,6 +145,8 @@ class Mamba3(nn.Module):
         angles = angles.unsqueeze(-2).expand(-1, -1, self.nheads, -1).to(torch.float32)
         B = self.B_norm(B)
         C = self.C_norm(C)
+        if self.is_mimo:
+            return z, x, B, C, ADT, DT, trap, angles
         return z, x, B.squeeze(2), C.squeeze(2), ADT, DT, trap, angles
 
     def _output(self, y, z, dtype):
@@ -138,9 +155,40 @@ class Mamba3(nn.Module):
             y = self.norm(y, z.flatten(-2))
         return self.out_proj(y.to(dtype))
 
+    def _output_mimo(self, y, z, dtype):
+        if self.is_outproj_norm and not self.fuse_pregate_headwise_norm:
+            # Official _postprocess, with ellipsis for either a token or a sequence.
+            z = torch.einsum("...hp,hrp->...rhp", z.float(), self.mimo_z)
+            z = z.flatten(-2).contiguous()
+            # Use the same float32 reduction layout in forward and step.
+            y = self.norm(y.flatten(-2).float().contiguous(), z)
+            y = y.reshape(*y.shape[:-1], self.nheads, self.headdim)
+            # Norm returns float32; einsum requires matching contraction dtypes
+            # when the module has been converted to float64 (or half precision).
+            dtype_out = torch.promote_types(y.dtype, self.mimo_o.dtype)
+            y = torch.einsum("...rhp,hrp->...hp", y.to(dtype_out), self.mimo_o.to(dtype_out))
+        return self.out_proj(y.flatten(-2).to(dtype))
+
     def forward(self, u, initial_states=None, return_final_states=False):
         """Map (batch, length, d_model) to outputs and optionally final states."""
         z, x, B, C, ADT, DT, trap, angles = self._project(u)
+        if self.is_mimo:
+            result = mamba3_mimo_chunked(
+                Q=C, K=B, V=x, ADT=ADT, DT=DT, Trap=trap,
+                Q_bias=self.C_bias, K_bias=self.B_bias, Angles=angles,
+                MIMO_V=self.mimo_x, MIMO_Z=self.mimo_z,
+                MIMO_O=self.mimo_o if (self.fuse_pregate_headwise_norm or not self.is_outproj_norm) else None,
+                D=self.D, Z=z if (self.fuse_pregate_headwise_norm or not self.is_outproj_norm) else None,
+                initial_states=initial_states, chunk_size=self.chunk_size, rotate_pairwise=False,
+                fused_norm=self.fuse_pregate_headwise_norm,
+                outproj_norm_weight=self.norm.weight if self.fuse_pregate_headwise_norm else None,
+                outproj_norm_eps=self.norm.eps if self.fuse_pregate_headwise_norm else 1e-5,
+                return_final_states=return_final_states,
+            )
+            if return_final_states:
+                y, states = result
+                return self._output_mimo(y, z, x.dtype), states
+            return self._output_mimo(result, z, x.dtype)
         result = mamba3_siso_chunked(
             Q=C, K=B, V=x, ADT=ADT, DT=DT, Trap=trap,
             Q_bias=self.C_bias.squeeze(1), K_bias=self.B_bias.squeeze(1),
@@ -156,6 +204,18 @@ class Mamba3(nn.Module):
     def step(self, u_t, states):
         """Decode (batch, d_model), returning outputs and new states."""
         z, x, B, C, ADT, DT, trap, angles = self._project(u_t.unsqueeze(1))
+        if self.is_mimo:
+            y, states = mamba3_mimo_step(
+                q=C[:, 0], k=B[:, 0], v=x[:, 0], adt=ADT[..., 0], dt=DT[..., 0],
+                trap=trap[..., 0], q_bias=self.C_bias, k_bias=self.B_bias, angles=angles[:, 0],
+                mimo_v=self.mimo_x, mimo_z=self.mimo_z,
+                mimo_o=self.mimo_o if (self.fuse_pregate_headwise_norm or not self.is_outproj_norm) else None,
+                D=self.D, z=z[:, 0] if (self.fuse_pregate_headwise_norm or not self.is_outproj_norm) else None,
+                states=states, rotate_pairwise=False, fused_norm=self.fuse_pregate_headwise_norm,
+                outproj_norm_weight=self.norm.weight if self.fuse_pregate_headwise_norm else None,
+                outproj_norm_eps=self.norm.eps if self.fuse_pregate_headwise_norm else 1e-5,
+            )
+            return self._output_mimo(y, z[:, 0], x.dtype), states
         y, states = mamba3_siso_step(
             q=C[:, 0], k=B[:, 0], v=x[:, 0], adt=ADT[..., 0], dt=DT[..., 0],
             trap=trap[..., 0], q_bias=self.C_bias.squeeze(1), k_bias=self.B_bias.squeeze(1),
@@ -168,6 +228,11 @@ class Mamba3(nn.Module):
         """Allocate zero states, promoting half/bfloat16 storage to float32."""
         device = self.in_proj.weight.device if device is None else device
         dtype = self.in_proj.weight.dtype if dtype is None else dtype
+        if self.is_mimo:
+            return _mimo_initial_states(
+                None, batch, self.mimo_rank, self.nheads, self.headdim, self.d_state,
+                self.num_rope_angles, device, _compute_dtype(dtype),
+            )
         return _initial_states(
             None, batch, self.nheads, self.headdim, self.d_state,
             self.num_rope_angles, device, _compute_dtype(dtype),

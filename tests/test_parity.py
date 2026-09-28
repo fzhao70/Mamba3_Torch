@@ -369,6 +369,6 @@ def test_block_residual():
         torch.testing.assert_close(block(u), expected, atol=0, rtol=0)
 
 
-def test_mimo_not_ported():
-    with pytest.raises(NotImplementedError, match="^MIMO not ported yet$"):
-        Mamba3(32, is_mimo=True)
+def test_mimo_constructs():
+    # MIMO is ported; its parity tests live in tests/test_mimo_parity.py.
+    assert Mamba3(32, d_state=16, headdim=8, is_mimo=True, mimo_rank=2).mimo_rank == 2
