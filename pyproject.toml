@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mamba3_torch"
+version = "0.1.0"
+description = "Pure-PyTorch Mamba-3 (SISO), parity-tested against the official state-spaces/mamba references"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0", "einops"]
+
+[tool.setuptools]
+packages = ["mamba3_torch"]
